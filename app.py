@@ -195,6 +195,7 @@ def call_mid_api(user_text: str) -> str:
         ],
         "temperature": 0.4,
         "reasoning_effort": reasoning_effort,
+        "stream": False,
     }
 
     try:
@@ -205,13 +206,27 @@ def call_mid_api(user_text: str) -> str:
             timeout=180,
         )
 
+        raw_text = response.text or ""
+
         if response.status_code != 200:
             return (
                 f"中转 API 请求失败：HTTP {response.status_code}\n"
-                f"{response.text[:1000]}"
+                f"{raw_text[:1000]}"
             )
 
-        data = response.json()
+        if not raw_text.strip():
+            return (
+                "中转 API 返回了 HTTP 200，但响应体是空的。\n"
+                "可能原因：中转站通道异常、模型 xhigh 超时、Key 被重置、或该通道不稳定。"
+            )
+
+        try:
+            data = response.json()
+        except Exception:
+            return (
+                "中转 API 返回了 HTTP 200，但内容不是 JSON。\n"
+                f"返回内容前 1000 字：\n{raw_text[:1000]}"
+            )
 
         if "choices" in data and data["choices"]:
             message = data["choices"][0].get("message", {})
@@ -227,10 +242,13 @@ def call_mid_api(user_text: str) -> str:
 
         return f"中转 API 已返回，但格式未识别：{str(data)[:1000]}"
 
+    except requests.exceptions.Timeout:
+        return "调用中转 API 超时：xhigh 思考强度可能太慢，建议先临时改成 high 测试。"
+
     except Exception as e:
         return f"调用中转 API 出错：{e}"
-
-
+    
+    
 # =============================
 # 企业微信主动发消息
 # =============================
