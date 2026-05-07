@@ -70,6 +70,7 @@ def is_duplicate_msg(msg_id: str, ttl: int = 600) -> bool:
         key for key, saved_at in RECENT_MSG_IDS.items()
         if current - saved_at > ttl
     ]
+
     for key in expired:
         RECENT_MSG_IDS.pop(key, None)
 
@@ -247,8 +248,8 @@ def call_mid_api(user_text: str) -> str:
 
     except Exception as e:
         return f"调用中转 API 出错：{e}"
-    
-    
+
+
 # =============================
 # 企业微信主动发消息
 # =============================
@@ -275,7 +276,13 @@ def get_wechat_access_token() -> str:
     }
 
     resp = requests.get(url, params=params, timeout=20)
-    data = resp.json()
+
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError(f"获取 access_token 返回非 JSON：HTTP {resp.status_code} {resp.text[:500]}")
+
+    print(f"[wechat token result] data={data}", flush=True)
 
     if data.get("errcode") != 0:
         raise RuntimeError(f"获取 access_token 失败：{data}")
@@ -296,6 +303,7 @@ def send_wechat_text(to_user: str, content: str):
         raise ValueError("AGENT_ID is not configured")
 
     access_token = get_wechat_access_token()
+
     url = "https://qyapi.weixin.qq.com/cgi-bin/message/send"
     params = {
         "access_token": access_token,
@@ -313,14 +321,24 @@ def send_wechat_text(to_user: str, content: str):
         }
 
         resp = requests.post(url, params=params, json=payload, timeout=20)
-        data = resp.json()
+
+        try:
+            data = resp.json()
+        except Exception:
+            raise RuntimeError(
+                f"发送企业微信消息返回非 JSON：HTTP {resp.status_code} {resp.text[:500]}"
+            )
+
+        print(f"[wechat send result] to_user={to_user}, data={data}", flush=True)
 
         if data.get("errcode") != 0:
-            print(f"[wechat send error] to_user={to_user}, data={data}")
+            raise RuntimeError(f"发送企业微信消息失败：{data}")
 
 
 def process_user_message_async(from_user: str, user_text: str):
     try:
+        print(f"[async start] from={from_user}, text={user_text[:80]}", flush=True)
+
         send_notice = get_env("SEND_THINKING_NOTICE", "true").lower() in (
             "1", "true", "yes", "y"
         )
@@ -331,8 +349,10 @@ def process_user_message_async(from_user: str, user_text: str):
         reply = call_mid_api(user_text)
         send_wechat_text(from_user, reply)
 
+        print(f"[async done] from={from_user}", flush=True)
+
     except Exception as e:
-        print(f"[async process error] {e}")
+        print(f"[async process error] {e}", flush=True)
 
 
 # =============================
@@ -384,6 +404,48 @@ def test_message():
     })
 
 
+@app.route("/send_test", methods=["POST"])
+def send_test():
+    """
+    专门测试企业微信主动发送消息是否正常。
+    示例：
+    curl -i -X POST https://gpt-wechat-bot.onrender.com/send_test -H "Content-Type: application/json" -d "{\"touser\":\"PanXiaoYu\",\"text\":\"企业微信主动发送测试\"}"
+    """
+    data = request.get_json(silent=True) or {}
+
+    to_user = (
+        data.get("touser")
+        or data.get("to_user")
+        or data.get("user")
+        or ""
+    ).strip()
+
+    text = (
+        data.get("text")
+        or "这是一条来自 Render 的企业微信主动发送测试消息。"
+    ).strip()
+
+    if not to_user:
+        return jsonify({
+            "error": "请传入 touser，例如：{\"touser\":\"PanXiaoYu\",\"text\":\"测试发送\"}"
+        }), 400
+
+    try:
+        send_wechat_text(to_user, text)
+        return jsonify({
+            "ok": True,
+            "touser": to_user,
+            "text": text,
+        })
+
+    except Exception as e:
+        print(f"[send_test error] {e}", flush=True)
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+        }), 500
+
+
 # =============================
 # 企业微信正式回调
 # =============================
@@ -408,13 +470,16 @@ def wechat_callback():
         expected_signature = sha1_signature(token, timestamp, nonce, echostr)
 
         if expected_signature != msg_signature:
+            print("[wechat verify error] invalid signature", flush=True)
             return "invalid signature", 403
 
         try:
             echo_plain = decrypt_wechat_message(echostr)
+            print("[wechat verify success]", flush=True)
             return echo_plain
+
         except Exception as e:
-            print(f"[wechat verify error] {e}")
+            print(f"[wechat verify error] {e}", flush=True)
             return f"decrypt echostr failed: {e}", 500
 
     raw_xml = request.data.decode("utf-8", errors="ignore")
@@ -432,6 +497,7 @@ def wechat_callback():
         expected_signature = sha1_signature(token, timestamp, nonce, encrypted)
 
         if expected_signature != msg_signature:
+            print("[wechat callback error] invalid signature", flush=True)
             return "invalid signature", 403
 
         decrypted_xml = decrypt_wechat_message(encrypted)
@@ -444,31 +510,35 @@ def wechat_callback():
 
         print(
             f"[wechat message] from={from_user}, "
-            f"type={msg_type}, msg_id={msg_id}, content={content[:80]}"
+            f"type={msg_type}, msg_id={msg_id}, content={content[:80]}",
+            flush=True,
         )
 
         if msg_id and is_duplicate_msg(msg_id):
-            print(f"[wechat duplicate] msg_id={msg_id}")
+            print(f"[wechat duplicate] msg_id={msg_id}", flush=True)
             return "success"
 
         if msg_type == "text" and from_user and content:
             thread = threading.Thread(
                 target=process_user_message_async,
                 args=(from_user, content),
-                daemon=True,
+                daemon=False,
             )
             thread.start()
 
         elif from_user:
-            send_wechat_text(
-                from_user,
-                "我目前先支持文字消息，你可以直接发送文字问题给我。"
-            )
+            try:
+                send_wechat_text(
+                    from_user,
+                    "我目前先支持文字消息，你可以直接发送文字问题给我。"
+                )
+            except Exception as e:
+                print(f"[wechat unsupported msg send error] {e}", flush=True)
 
         return "success"
 
     except Exception as e:
-        print(f"[wechat callback error] {e}")
+        print(f"[wechat callback error] {e}", flush=True)
         return "success"
 
 
